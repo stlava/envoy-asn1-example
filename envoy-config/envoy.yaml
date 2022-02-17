@@ -1,0 +1,175 @@
+static_resources:
+  listeners:
+    - name: main
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 18000
+      filter_chains:
+        - filters:
+            - name: envoy.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: auto
+                route_config:
+                  name: local_route
+                http_filters:
+                  - name: envoy.filters.http.lua
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                      source_codes:
+                        base64.lua:
+                          filename: /envoy-config/base64.lua
+                      inline_code: |
+                        -- Load in libraries from the istio-lua-libs configmap
+                        base64 = require "/envoy-config/base64"
+
+                        function raw_signature_to_asn1(raw_signature)
+                            -- Encode raw ECDSA signature into ASN.1 so that it can be used as input
+                            -- for handler:verifySignature.
+                            --
+                            -- The raw signature is 64 bytes with the upper 32 bytes being the 'r'
+                            -- component and the lower 32 bytes being the 's' component.
+                            --
+                            -- rfc3278[1] defines the ECDSA ASN.1 signature as being the following:
+                            --
+                            -- ECDSA-Sig-Value ::= SEQUENCE {
+                            --   r INTEGER,
+                            --   s INTEGER }
+                            --
+                            -- A full fledged ASN.1 encoder is fairly complicated so we're going to
+                            -- take a short cut here. The resulting ASN.1 encoded signature is simply
+                            -- going to be the bytes of 'r' and 's' along with some basic encoding
+                            -- information.
+                            --
+                            -- SEQUENCE:
+                            --   The first byte of the sequence is \x30 which denotes the start. It
+                            --   is then followed by a byte containing the number of bytes to follow.
+                            --
+                            -- INTEGER:
+                            --   The first byte of the integer is \x02 which denotes the start. It
+                            --   is then followed by a byte containing the number of bytes to follow.
+                            --   For 2's compliment reasons \x00 is added to the integer if the most
+                            --   significant byte is greater than 127.
+                            --
+                            -- Example input:
+                            --   r = \x03
+                            --   s = \x82
+                            --
+                            -- Example output:
+                            --   \x30\x07 \x02\x01\x03 \x02\x02\x00\x82
+                            --   ^^^^^^^^ ^^^^^^^^^^^^ ^^^^^^^^^^^^^^^^
+                            --   |        |            |
+                            --   |        |            +- Integer of length 2 bytes of value \x00\x82
+                            --   |        |
+                            --   |        +- Integer of length 1 byte with value \0x03
+                            --   |
+                            --   +- Sequence of length 7 bytes
+                            --
+                            --  Since \x82 is greater than 127 (\x7f) padding is added.
+                            --
+                            --
+                            -- Refrences:
+                            --  [1] https://www.rfc-editor.org/rfc/rfc3278#section-8.2
+                            --
+
+                            if string.len(raw_signature) ~= 64 then
+                              print("signature length mismatch")
+                              return
+                            end
+
+                            -- Split up 'r' and 's'
+                            local r = string.sub(raw_signature,0,32)
+                            local s = string.sub(raw_signature,33,64)
+
+                            -- Start the sequence
+                            local sigEnc = '\x30'
+
+                            -- Encode 'r' and 's'. Since the ECDSA signature is of fixed length we know
+                            -- our integers will always either be 32 (\x20) or 33 (\x21) bytes depending
+                            -- on if padding is required. If the MSB is greater than 127 then add padding.
+                            if string.byte(string.sub(r,0,1)) > 127 then
+                               r = '\x02\x21\x00' .. r
+                            else
+                               r = '\x02\x20' .. r
+                            end
+
+                            if string.byte(string.sub(s,0,1)) > 127 then
+                               s = '\x02\x21\x00' .. s
+                            else
+                               s = '\x02\x20' .. s
+                            end
+
+                            -- Combine 'r' and 's' and find the length so that it can then be encoded.
+                            local rs = r .. s
+                            rsLen = string.len(rs)
+
+                            -- Add total length.
+                            if rsLen == 68 then
+                              sigEnc = sigEnc .. '\x44'
+                            elseif rsLen == 69 then
+                              sigEnc = sigEnc .. '\x45'
+                            elseif rsLen == 70 then
+                              sigEnc = sigEnc .. '\x46'
+                            else
+                              print("unexpected encoded length")
+                              return
+                            end
+
+                            -- Finally add in the encoded 'r' and 's'.
+                            sigEnc = sigEnc .. rs
+
+                            return sigEnc
+                        end
+
+                        function envoy_on_request(request_handle)
+                          request_handle:logInfo("filter beginning")
+
+                          -- Split up JWT token into header, payload, and signature.
+                          local x_amzn_oidc_data = request_handle:headers():get("x-amzn-oidc-data")
+                          if x_amzn_oidc_data==null then
+                            request_handle:respond({[":status"] = "400"}, "x-amzn-oidc-data header missing!")
+                            return
+                          end
+
+                          request_handle:logInfo("x-amzn-oidc-data: " .. x_amzn_oidc_data)
+                          jwt_table={}
+                          local jwt_keys={"header", "payload", "signature"}
+                          local i=1
+                          for token in x_amzn_oidc_data:gmatch("([^.]+)") do
+                            jwt_table[jwt_keys[i]]=token
+                            i=i+1
+                          end
+
+                          -- Public key generated by client.py
+                          local key = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEmyuuRixAItd2StXgNOv7qfc/rMs1\ndqLR7jaF3D+hEt/l9RPjsfqOFHwrOzOl6QpdoCVAPszYPocHp5FaI59ByQ=="
+                          local rawkey = base64.decode(key)
+
+                          -- Base64 url decode signature
+                          local sig=jwt_table["signature"]
+                          sig = string.gsub(sig, "-", "+")
+                          sig = string.gsub(sig, "_", "/")
+                          local decoded_jwt_signature=base64.decode(sig)
+
+                          -- Verify signature
+                          request_handle:logInfo("checking signature against key")
+                          local pubkey = request_handle:importPublicKey(rawkey, string.len(rawkey)):get()
+                          if pubkey == nil then
+                            request_handle:logErr("unable to load public key")
+                            return
+                          end
+
+                          local header_plus_payload = string.format("%s.%s", jwt_table["header"], jwt_table["payload"])
+                          sigAsn1 = raw_signature_to_asn1(decoded_jwt_signature)
+
+                          local ok, error = request_handle:verifySignature("sha256", pubkey, sigAsn1, string.len(sigAsn1), header_plus_payload, string.len(header_plus_payload))
+                          if ok then
+                            request_handle:logInfo("signature valid")
+                            request_handle:respond({[":status"] = "200"}, "signature valid")
+                          else
+                            request_handle:logInfo("signature invalid")
+                            request_handle:respond({[":status"] = "403"}, "unable to verify signature")
+                          end
+                        end
+                  - name: envoy.filters.http.router
